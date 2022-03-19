@@ -53,8 +53,10 @@ def ischar(i):
 
 def decode_petscii(c):
     # return c.decode('petscii_c64en_lc', errors='replace').replace('\r', '\n')
-    return c.replace(b'\n\r', b'\r').replace(b'\r\n', b'\r').replace(b'\n', b'\r').decode('petscii_c64en_lc',
-                                                                                          errors='replace')
+    x = c.replace(b'\n\r', b'\r').replace(b'\r\n', b'\r').replace(b'\n', b'\r').decode('petscii_c64en_lc',
+                                                                                       errors='replace')
+    x = x.replace('\r', '\n')
+    return x
 
 
 def decode_ascii(c):
@@ -138,7 +140,8 @@ def insert_newlines(c):
 
 def fix_umlaute(c):
     matches = list(regex.finditer(
-        r'[a-zA-Z]([^\p{Latin} \p{punct}\p{N}\r\n\t\p{Sc}\p{Sm}\N{CHECK MARK}\-|"\uf100-\uf10f\ufffd])[a-zA-Z ]', c))
+        r'[a-zA-Z]([^\p{Latin} \p{N}\r\n\t\p{Sc}\p{Sm}\N{CHECK MARK}@.,?!;/(){}\':\-|"\uf100-\uf10f\ufffd])[a-zA-Z ]',
+        c))
     if len(matches) > 0:
         replacement_chars = set()
         trigrams = list()
@@ -250,18 +253,19 @@ class TEIWriter(OutputWriter):
 
         self.xf.write('      ')
         with self.xf.element('div2', name=filename, type='file'):
-            self.xf.write('\n')
-            lineno = 1
-            for l in more_itertools.split_at(formatted_content, lambda x: x == '\n'):
-                self.xf.write('    ')
-                if linebreaks_added:
-                    with self.xf.element('supplied', reason='omitted-in-original'):
-                        self.xf.write(etree.Element('lb', n=str(lineno)))
-                    self.xf.write(*l)
-                else:
-                    self.xf.write(etree.Element('lb', n=str(lineno)), *l)
+            with self.xf.element('p'):
                 self.xf.write('\n')
-                lineno = lineno + 1
+                lineno = 1
+                for l in more_itertools.split_at(formatted_content, lambda x: x == '\n'):
+                    self.xf.write('    ')
+                    if linebreaks_added:
+                        with self.xf.element('supplied', reason='omitted-in-original'):
+                            self.xf.write(etree.Element('lb', n=str(lineno)))
+                        self.xf.write(*l)
+                    else:
+                        self.xf.write(etree.Element('lb', n=str(lineno)), *l)
+                    self.xf.write('\n')
+                    lineno = lineno + 1
 
     def write_binary_file(self, filename, content):
         self.xf.write('      ')
@@ -276,7 +280,55 @@ class TEIWriter(OutputWriter):
     def end(self):
         self.text_root.__exit__(None, None, None)
         self.tei_root.__exit__(None, None, None)
-        self.xf.__exit__(None, None, None)
+
+
+class HTMLWriter(OutputWriter):
+
+    def __init__(self):
+        self.xf = None
+        self.html_root = None
+        self.body_root = None
+
+    def begin(self):
+        self.xf = etree.htmlfile(sys.stdout.buffer, buffered=False, encoding='utf-8').__enter__()
+        self.xf.write_doctype('<!DOCTYPE HTML>')
+
+        self.html_root = self.xf.element('html')
+        self.html_root.__enter__()
+        self.xf.write('\n  ')
+        with self.xf.element('head'):
+            self.xf.write(etree.fromstring(
+                '<style>pre {max-width: 1000px; overflow-wrap: break-word; white-space: pre-wrap}</style>'))
+
+        self.xf.write('\n  ')
+        self.body_root = self.xf.element('body')
+        self.body_root.__enter__()
+        self.xf.write('\n')
+
+    def begin_diskmag(self, name):
+        self.xf.write('    ')
+        with self.xf.element('h2'):
+            self.xf.write(name)
+        self.xf.write('\n')
+
+    def write_text_file(self, filename, content, linebreaks_added=False, substitutions=None):
+        self.xf.write('     ')
+        with self.xf.element('h3'):
+            self.xf.write(filename)
+        self.xf.write('\n     ')
+        with self.xf.element('pre'):
+            self.xf.write(content)
+        self.xf.write('\n')
+
+    def write_binary_file(self, filename, content):
+        pass
+
+    def end_diskmag(self):
+        self.xf.write('\n')
+
+    def end(self):
+        self.body_root.__exit__(None, None, None)
+        self.html_root.__exit__(None, None, None)
 
 
 class StdoutWriter(OutputWriter):
@@ -336,8 +388,11 @@ def main():
                         help='Füge für jede Datei regelmäßige Zeilenumbrüche ein, falls diese fehlen',
                         action=argparse.BooleanOptionalAction)
     group = parser.add_mutually_exclusive_group()
-    group.add_argument('--tei', help='Schreibe Ergebnisse als TEI-codierte XML-Datei in die Standardausgabe',
-                       action='store_const', dest='outtype', const='xml')
+    group.add_argument('--xml',
+                       help='Schreibe Ergebnisse als einzelne pseudo-TEI-codierte XML-Datei in die Standardausgabe',
+                       action='store_const', dest='outtype', const='tei')
+    group.add_argument('--html', help='Schreibe Ergebnisse als einzelne HTML-Datei in die Standardausgabe',
+                       action='store_const', dest='outtype', const='html')
     group.add_argument('--stdout', default=True,
                        help='Schreibe Ergebnisse unformatiert und konkateniert in die Standardausgabe',
                        action='store_const', dest='outtype', const='stdout')
@@ -352,6 +407,8 @@ def main():
 
     if args.outtype == 'tei':
         writer = TEIWriter()
+    elif args.outtype == 'html':
+        writer = HTMLWriter()
     elif args.writefiles is not None:
         writer = FilesWriter(args.writefiles)
     else:

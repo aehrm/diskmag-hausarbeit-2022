@@ -15,8 +15,11 @@ import numpy as np
 import regex
 from lxml import etree
 
-CORPUS_TRIGRAMS = collections.defaultdict(lambda: 0, [(x.split('\t')[0], int(x.split('\t')[1].strip())) for x in open(
-    os.path.join(os.path.dirname(__file__), 'trigram_counts.tsv'))])
+TRIGRAM_COUNTS_UMLAUTE = collections.defaultdict(lambda: 0, [(x.split('\t')[0], int(x.split('\t')[1].strip())) for x in open(
+    os.path.join(os.path.dirname(__file__), 'trigram_counts_umlaute.tsv'))])
+
+TRIGRAM_COUNTS_BEGINWORD = collections.defaultdict(lambda: 0, [(x.split('\t')[0], int(x.split('\t')[1])) for x in open(
+    os.path.join(os.path.dirname(__file__), 'trigram_counts_beginword.tsv'))])
 
 CUS_MAPPING = {}
 for l in open('pet_unicode.txt'):
@@ -48,6 +51,7 @@ def ischar_ascii(i):
 def ischar(i):
     if 65 <= i <= 90: return True
     if 97 <= i <= 122: return True
+    if 193 <= i <= 218: return True
     return False
 
 
@@ -72,31 +76,34 @@ def entropy(content):
 
 
 def read_diskmag(diskmag_file):
-    with d64.DiskImage(diskmag_file) as disk:
-        for p in disk.glob(b'*'):
-            if b'=' in p.name: continue
-            name = p.name.decode(encoding='petscii_c64en_lc', errors='replace')
+    try:
+        with d64.DiskImage(diskmag_file) as disk:
+            for p in disk.glob(b'*'):
+                if b'=' in p.name: continue
+                name = p.name.decode(encoding='petscii_c64en_lc', errors='replace')
 
-            try:
-                f = disk.path(p.name).open()
-                content = f.read()
-            except (ValueError, AttributeError) as e:
-                logging.info(f'Konnte Datei {name} in {diskmag_file} nicht lesen. Überspringe. {e}')
-                continue
+                try:
+                    f = disk.path(p.name).open()
+                    content = f.read()
+                except (ValueError, AttributeError) as e:
+                    logging.info(f'Konnte Datei {name} in {diskmag_file} nicht lesen. Überspringe. {e}')
+                    continue
 
-            if len(content) > f.entry.size * 256:
-                logging.info(
-                    f'Datei {name} in {diskmag_file} ist {np.ceil(len(content) / 256).astype(int)} blöcke lang, Verzeichnis sagt aber {f.entry.size}. Überspringe.')
-                continue
+                if len(content) > f.entry.size * 256:
+                    logging.info(
+                        f'Datei {name} in {diskmag_file} ist {np.ceil(len(content) / 256).astype(int)} blöcke lang, Verzeichnis sagt aber {f.entry.size}. Überspringe.')
+                    continue
 
-            yield name, content
+                yield name, content
+    except NotImplementedError as e:
+        logging.info(f'Konnte Datei {diskmag_file} nicht lesen. Überspringe. {e}')
 
 
 def classify_content(content):
     if entropy(content) > 7:
         return 'compressed'
-    max_sma = np.max(np.convolve(np.array([ischar(x) for x in content]).astype(int), np.ones(20) / 20, mode='valid'))
-    if max_sma < 0.5:
+    chars = np.array([ischar(x) for x in content]).astype(int).mean()
+    if chars < 0.5:
         return 'code'
     ascii_chars = np.array([ischar_ascii(x) for x in content]).astype(int).mean()
     petscii_chars = np.array([ischar_petscii(x) for x in content]).astype(int).mean()
@@ -110,64 +117,63 @@ def classify_content(content):
 
 
 def insert_newlines(c):
-    if regex.match(r'^.?\N{REPLACEMENT CHARACTER}', c):
-        # das ist ziemlich sicher eine PRG Load Adresse
-        c = c[2:]
-
-    scores = {}
+    logprobs = {}
+    s = sum(TRIGRAM_COUNTS_BEGINWORD.values())
     for col_len in range(40, 81):
         rows = [''.join(x) for x in more_itertools.chunked(c, n=col_len)]
-        score = 0
-        if len(rows[-1]) != col_len:
-            score = score - 10
-        for r in rows:
-            if regex.search(r'^[ \-.,]', r):
-                score = score - 1
-            if regex.search(r'^\p{L}[ .,;]', r):
-                score = score - 1
-            if regex.search(r' \p{L}$', r):
-                score = score - 1
-            if regex.search(r'[\-,.]$', r):
-                score = score + 1
-            if regex.search(r'\p{Ll}\p{Lu}', r):
-                score = score - 1
-        scores[col_len] = score
+        scores = []
+        for prev_row, row in zip(itertools.chain([None], rows), rows):
+            if prev_row is not None and prev_row.endswith('-'):
+                continue
+            trigram = row[:3]
+            if regex.fullmatch(r'\p{Latin}[.,!?; ][\p{Latin} ]', trigram):
+                scores.append(-100)
+                continue
+            if trigram == '   ' or not regex.fullmatch(r'[ \p{Latin}]{3}', trigram):
+                continue
+            prob = TRIGRAM_COUNTS_BEGINWORD[trigram] / s
+            if prob == 0:
+                scores.append(-100)
+            else:
+                scores.append(np.log(prob))
+        logprobs[col_len] = np.mean(scores)
 
-    best_col_len, score = max(scores.items(), key=lambda l: l[1])
+    best_col_len, logprob = max(logprobs.items(), key=lambda l: l[1])
     rows = [''.join(x) for x in more_itertools.chunked(c, n=best_col_len)]
     return '\n'.join(rows), best_col_len
 
 
 def fix_umlaute(c):
     matches = list(regex.finditer(
-        r'[a-zA-Z]([^\p{Latin} \p{N}\r\n\t\p{Sc}\p{Sm}\N{CHECK MARK}@.,?!;/(){}\':\-|"\uf100-\uf10f\ufffd])[a-zA-Z ]',
+        r'[a-zA-Z ]([^\P{So}\N{CHECK MARK}\N{REPLACEMENT CHARACTER}]|[\uf110-\ufffc])[a-zA-Z ,.:;\-"!?]',
         c))
     if len(matches) > 0:
         replacement_chars = set()
         trigrams = list()
         for m in matches:
             replacement_chars.add(m.group(1))
-            trigrams.append(c[m.start(1) - 1:m.end(1) + 1])
+            trigrams.append(regex.sub(r'[,.:;\-"?!]', ' ', c[m.start(1) - 1:m.end(1) + 1]))
 
         if len(replacement_chars) > len('äöüÄÖÜß'):
             raise ValueError(f'Mehr unbekannte Zeichen als Umlaute vorhanden.')
 
-        mapping_scores = {}
+        s = sum(TRIGRAM_COUNTS_UMLAUTE.values())
+        mapping_logprobs = {}
         for mapping in itertools.permutations(list('äöüÄÖÜß'), r=len(replacement_chars)):
             trans = dict(zip(replacement_chars, mapping))
             score = 0
             translated_trigrams = [t.translate(str.maketrans(trans)) for t in trigrams]
             for t in translated_trigrams:
-                prob = CORPUS_TRIGRAMS[t] / CORPUS_TRIGRAMS[t[1]]
+                prob = TRIGRAM_COUNTS_UMLAUTE[t] / s
                 if prob == 0:
                     score += -50
                 else:
                     score += np.log(prob)
 
-            mapping_scores[mapping] = score
+            mapping_logprobs[mapping] = score
 
-        best_mapping, best_score = max(mapping_scores.items(), key=lambda l: l[1])
-        if best_score < -50 * len(trigrams) * 2 / 3:
+        best_mapping, best_logprob = max(mapping_logprobs.items(), key=lambda l: l[1])
+        if best_logprob < -50 * len(trigrams) * 2 / 3:
             raise ValueError(f'Keine geeignete Belegung für Umlaute gefunden.')
 
         trans = dict(zip(replacement_chars, best_mapping))
@@ -232,8 +238,10 @@ class TEIWriter(OutputWriter):
 
     def begin_diskmag(self, name):
         self.xf.write('    ')
-        self.disk_root = self.xf.element('div1', type='diskmag', name=name)
+        self.disk_root = self.xf.element('div1', type='diskmag')
         self.disk_root.__enter__()
+        with self.xf.element('head', rend='hidden'):
+            self.xf.write(name)
         self.xf.write('\n')
 
     def write_text_file(self, filename, content, linebreaks_added=False, substitutions=None):
@@ -252,7 +260,9 @@ class TEIWriter(OutputWriter):
                     formatted_content.append(char)
 
         self.xf.write('      ')
-        with self.xf.element('div2', name=filename, type='file'):
+        with self.xf.element('div2', type='file_text'):
+            with self.xf.element('head', rend='hidden'):
+                self.xf.write(filename)
             with self.xf.element('p'):
                 self.xf.write('\n')
                 lineno = 1
@@ -269,8 +279,10 @@ class TEIWriter(OutputWriter):
 
     def write_binary_file(self, filename, content):
         self.xf.write('      ')
-        self.xf.write(etree.Element('div2', name=filename, type='file', content='binary', filesize=str(len(content))))
-        self.xf.write('\n')
+        self.xf.write(etree.Element('div2', type='file_binary'))
+        with self.xf.element('head', rend='hidden'):
+            self.xf.write(filename)
+        self.xf.write(etree.Element('gap', extent=f"{str(len(content))} bytes", reason="cacelled"), '\n')
 
     def end_diskmag(self):
         self.xf.write('    ')
@@ -356,20 +368,31 @@ class FilesWriter(OutputWriter):
 
     def __init__(self, output_directory):
         self.output_directory = output_directory
+        if not os.path.isdir(self.output_directory):
+            logging.error(f'Ausgabeverzeichnis {self.output_directory} existiert nicht, beende.')
+            sys.exit(1)
         self.current_diskmag = None
+        self.file_counter = 1
 
     def begin(self):
         pass
 
     def begin_diskmag(self, name):
         self.current_diskmag = name
+        self.file_counter = 1
 
     def write_text_file(self, filename, content, linebreaks_added=False, substitutions=None):
-        filename = regex.sub(r'[^\w ]', '-', filename)
-        with open(os.path.join(self.output_directory, self.current_diskmag + '_' + filename), 'w') as f:
+        filename = regex.sub(r'[\N{REPLACEMENT CHARACTER}\s]', '-', filename)
+        output_path = os.path.join(self.output_directory, self.current_diskmag + '_' + f'{self.file_counter:04d}' + '_' + filename)
+        if os.path.exists(output_path):
+            logging.error(f'Ausgabedatei {output_path} existiert bereits! Verweigere Überschreiben.')
+            sys.exit(1)
+        with open(output_path, 'w') as f:
             print(content, file=f)
+        self.file_counter = self.file_counter + 1
 
     def write_binary_file(self, filename, content):
+        self.file_counter = self.file_counter + 1
         pass
 
     def end_diskmag(self):
@@ -421,7 +444,7 @@ def main():
         writer.begin_diskmag(os.path.basename(diskmag_file))
 
         for name, content in read_diskmag(diskmag_file):
-            name = regex.sub(r'[^a-zA-Z0-9_\-.]', '\N{REPLACEMENT CHARACTER}', name)
+            name = regex.sub(r'[^a-zA-Z0-9_\-.!?:;*+=(){}^&%$#@]', '\N{REPLACEMENT CHARACTER}', name)
             logging.info(f'Bearbeite Datei {name} in {diskmag_file}')
             classification = classify_content(content)
             if classification == 'petscii':
@@ -446,7 +469,8 @@ def main():
                         f'In Datei {name} in {diskmag_file}: Konnte keine geeignete Substitution für Umlaute ermitteln. {e}')
 
             best_col_len = None
-            if args.fix_umbrueche and '\n' not in c and 50 < len(c) < 5000:
+            if args.fix_umbrueche and content[:2] == b'\x00\x40':
+                c = c[2:]
                 c, best_col_len = insert_newlines(c)
                 logging.info(
                     f'In Datei {name} in {diskmag_file}: füge alle {best_col_len} Zeichen einen Zeilenumbruch hinzu.')

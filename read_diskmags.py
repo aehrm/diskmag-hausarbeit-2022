@@ -22,7 +22,7 @@ TRIGRAM_COUNTS_BEGINWORD = collections.defaultdict(lambda: 0, [(x.split('\t')[0]
     os.path.join(os.path.dirname(__file__), 'trigram_counts_beginword.tsv'))])
 
 CUS_MAPPING = {}
-for l in open('pet_unicode.txt'):
+for l in open(os.path.join(os.path.dirname(__file__), 'pet_unicode.txt')):
     if l.startswith('#'): continue
     k, v = tuple(l.strip().split(';')[:2])
     CUS_MAPPING[int(k, 16)] = v + ' (CUS)'
